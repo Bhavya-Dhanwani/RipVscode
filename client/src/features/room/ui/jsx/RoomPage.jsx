@@ -30,6 +30,7 @@ export default function RoomPage({ roomCode }) {
   // Pull live participant data from Redux.
   const participants = useSelector((state) => state.room.participants);
   const currentParticipant = useSelector((state) => state.room.currentParticipant);
+  const typingUsers = useSelector((state) => state.room.typingUsers);
 
   const {
     isShareOpen,
@@ -61,6 +62,7 @@ export default function RoomPage({ roomCode }) {
           roomCode={roomCode}
           participants={participants}
           currentParticipant={currentParticipant}
+          typingUsers={typingUsers}
           onKick={kickParticipant}
         />
       </div>

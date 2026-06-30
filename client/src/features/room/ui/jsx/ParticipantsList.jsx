@@ -40,6 +40,7 @@ function getAvatarColor(id) {
 export default function ParticipantsList({
   participants = [],
   currentParticipant = null,
+  typingUsers = {},
   onKick = () => {},
   onCloseSidebar = () => {},
   roomCode = "",
@@ -99,6 +100,13 @@ export default function ParticipantsList({
                     {isParticipantHost && (
                       <span className={styles.hostBadge}>(host)</span>
                     )}
+                    {typingUsers[pid] && (
+                      <span className={styles.typingDots}>
+                        <span className={styles.typingDot} />
+                        <span className={styles.typingDot} />
+                        <span className={styles.typingDot} />
+                      </span>
+                    )}
                   </div>
                   <div className={styles.statusRow}>
                     <span
@@ -110,7 +118,11 @@ export default function ParticipantsList({
                       }}
                     />
                     <span className={styles.statusText}>
-                      {participant.isOnline ? "Online" : "Offline"}
+                      {!participant.isOnline
+                        ? "Offline"
+                        : typingUsers[pid]
+                          ? "typing..."
+                          : "Online"}
                     </span>
                   </div>
                 </div>

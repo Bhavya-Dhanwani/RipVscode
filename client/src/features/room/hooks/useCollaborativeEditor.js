@@ -10,64 +10,123 @@ import {
   clearRoom,
   addParticipant,
   removeParticipant,
+  setTypingStatus,
 } from "../state/roomSlice";
 import { createDeltaFromChange, deltaToMonacoOperation } from "../lib/delta";
 
-// Coordinates the realtime collaboration session for a room:
-// loads the initial document, resolves this client's identity, manages the
-// Socket.IO connection, applies remote edits, and tracks presence and closure.
+// Unique color assigned to each remote cursor.
+const CURSOR_COLORS = [
+  "#ef4444", "#f97316", "#eab308", "#22c55e",
+  "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899",
+];
+let colorIndex = 0;
+const userColorMap = new Map();
+function getColorForUser(userId) {
+  if (!userColorMap.has(userId)) {
+    userColorMap.set(userId, CURSOR_COLORS[colorIndex % CURSOR_COLORS.length]);
+    colorIndex++;
+  }
+  return userColorMap.get(userId);
+}
+
 export function useCollaborativeEditor(roomCode) {
   const dispatch = useDispatch();
   const router = useRouter();
   const authUser = useSelector((state) => state.auth.user);
 
-  // Initial document for Monaco; null until it has been fetched.
-  const [document, setDocument] = useState(null);
-
-  // Connection status for diagnostics and future UI wiring.
+  const [editorDocument, setEditorDocument] = useState(null);
   const [status, setStatus] = useState("connecting");
-
-  // Set when the host ends the session, with the host's display name.
   const [roomClosed, setRoomClosed] = useState(false);
   const [closedBy, setClosedBy] = useState("");
 
-  // Refs that must stay current without re-running the connection effect.
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
   const participantRef = useRef(null);
   const authUserRef = useRef(authUser);
-
-  // Current document version used as the base version for outgoing deltas.
   const versionRef = useRef(1);
-
-  // Guards against re-emitting edits that came from applying a remote delta.
   const isApplyingRemoteRef = useRef(false);
-
-  // Disposable for the Monaco change listener.
   const changeDisposableRef = useRef(null);
 
-  // Keep the latest authenticated user available to async callbacks.
+  // Remote cursors
+  const remoteCursorsRef = useRef(new Map());
+  const cursorDecorationsRef = useRef([]);
+
+  // Typing
+  const typingTimeoutRef = useRef(null);
+
   useEffect(() => {
     authUserRef.current = authUser;
   }, [authUser]);
 
-  // Capture the Monaco instances and start converting local edits into deltas.
+  // Update Monaco decorations to reflect all remote cursors.
+  const updateCursorDecorations = useCallback(() => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!model) return;
+
+    const newDecorations = [];
+    remoteCursorsRef.current.forEach((data, userId) => {
+      if (data.offset == null) return;
+      const color = data.color || "#ef4444";
+      const label = data.displayName || userId.slice(0, 6);
+
+      const pos = model.getPositionAt(data.offset);
+      if (!pos) return;
+
+      // Vertical line at cursor position
+      newDecorations.push({
+        range: { startLineNumber: pos.lineNumber, startColumn: pos.column, endLineNumber: pos.lineNumber, endColumn: pos.column + 1 },
+        options: {
+          className: `remote-cursor-${userId}`,
+          beforeContentClassName: `remote-cursor-line`,
+          stickiness: 1,
+          hoverMessage: { value: `**${label}**` },
+        },
+      });
+
+      // Name label above cursor
+      newDecorations.push({
+        range: { startLineNumber: pos.lineNumber, startColumn: pos.column, endLineNumber: pos.lineNumber, endColumn: pos.column },
+        options: {
+          afterContentClassName: `remote-cursor-label`,
+          stickiness: 1,
+          after: { content: ` ${label}`, inlineClassName: `cursor-label-text`, color: color },
+        },
+      });
+    });
+
+    cursorDecorationsRef.current = editor.deltaDecorations(cursorDecorationsRef.current, newDecorations);
+  }, []);
+
+  // Emit cursor position on editor changes and cursor position changes.
   const handleEditorMount = useCallback(
     (editor, monaco) => {
       editorRef.current = editor;
       monacoRef.current = monaco;
 
-      // Convert local Monaco edits into backend deltas and emit them.
+      // Register cursor label CSS in the editor
+      const styleEl = document.createElement("style");
+      styleEl.textContent = `
+        .remote-cursor-line { border-left: 2px solid; margin-left: -1px; }
+        .remote-cursor-label {
+          position: relative; z-index: 10; pointer-events: none;
+        }
+        .cursor-label-text {
+          font-size: 11px; font-weight: 600; padding: 1px 4px;
+          border-radius: 3px; margin-left: 2px;
+          white-space: nowrap; position: relative; top: -4px;
+        }
+      `;
+      document.head.appendChild(styleEl);
+
+      // Emit code deltas and typing indicator on content change.
       changeDisposableRef.current = editor.onDidChangeModelContent((event) => {
-        // Ignore edits produced by applying a remote delta to avoid feedback loops.
         if (isApplyingRemoteRef.current) return;
 
-        // Apply higher offsets first so earlier (lower) offsets stay valid.
         const orderedChanges = [...event.changes].sort(
           (a, b) => b.rangeOffset - a.rangeOffset,
         );
 
-        // Emit one delta per change, advancing the local version each time.
         for (const change of orderedChanges) {
           const delta = createDeltaFromChange(change, {
             version: versionRef.current,
@@ -78,33 +137,63 @@ export function useCollaborativeEditor(roomCode) {
           socket.emit("code-change", { roomCode, delta });
           versionRef.current += 1;
         }
+
+        // Emit typing indicator
+        const me = participantRef.current;
+        if (me) {
+          socket.emit("typing-start", {
+            roomCode,
+            participantId: me.id || me._id,
+            displayName: me.displayName,
+          });
+
+          clearTimeout(typingTimeoutRef.current);
+          typingTimeoutRef.current = setTimeout(() => {
+            socket.emit("typing-stop", {
+              roomCode,
+              participantId: me.id || me._id,
+            });
+          }, 1500);
+        }
+
+        // Emit cursor position
+        const posModel = editor.getModel();
+        const position = editor.getPosition();
+        if (position && posModel) {
+          const offset = posModel.getOffsetAt(position);
+          socket.emit("cursor-move", { roomCode, offset });
+        }
+      });
+
+      // Emit cursor position on cursor position change (no typing).
+      editor.onDidChangeCursorPosition((e) => {
+        const model = editor.getModel();
+        if (!model) return;
+        const position = editor.getPosition();
+        if (position) {
+          const offset = model.getOffsetAt(position);
+          socket.emit("cursor-move", { roomCode, offset });
+        }
       });
     },
     [roomCode],
   );
 
-  // Leave the room; the host additionally ends the session for everyone else.
   const leaveRoom = useCallback(() => {
     const participant = participantRef.current;
-
-    // A host leaving ends the session and closes the room for all guests.
     if (participant?.role === "HOST") {
       socket.emit("end-session", {
         roomCode,
         hostName: participant.displayName,
       });
     }
-
-    // Navigate home; the effect cleanup emits leave-room and disconnects.
     router.push("/");
   }, [roomCode, router]);
 
-  // Kick a participant from the room (host only).
   const kickParticipant = useCallback(
     (targetParticipantId) => {
       const me = participantRef.current;
       if (!me || me.role !== "HOST") return;
-
       socket.emit("kick-participant", {
         roomCode,
         hostParticipantId: me.id || me._id,
@@ -114,13 +203,11 @@ export function useCollaborativeEditor(roomCode) {
     [roomCode],
   );
 
-  // Load the room and open/clean up the realtime connection.
   useEffect(() => {
     if (!roomCode) return;
 
     let cancelled = false;
 
-    // Announce presence to the room; re-runs automatically on reconnect.
     const handleConnect = () => {
       setStatus("connected");
       if (participantRef.current) {
@@ -131,18 +218,15 @@ export function useCollaborativeEditor(roomCode) {
       }
     };
 
-    // Track connection drops for status reporting.
     const handleDisconnect = () => {
       setStatus("disconnected");
     };
 
-    // Apply a remote edit to Monaco without re-emitting it.
     const handleRemoteChange = ({ delta, version }) => {
       const editor = editorRef.current;
       const model = editor?.getModel();
       if (!model) return;
 
-      // Suppress the change listener while the remote edit is applied.
       isApplyingRemoteRef.current = true;
       try {
         const operation = deltaToMonacoOperation(delta, model);
@@ -151,17 +235,14 @@ export function useCollaborativeEditor(roomCode) {
         isApplyingRemoteRef.current = false;
       }
 
-      // Adopt the authoritative version that produced this edit.
       versionRef.current = version;
     };
 
-    // Resynchronize the whole document when the server reports the client is stale.
     const handleSyncRequired = ({ version, document: latestDocument }) => {
       const editor = editorRef.current;
       const model = editor?.getModel();
       if (!model) return;
 
-      // Replace the model content while suppressing the change listener.
       isApplyingRemoteRef.current = true;
       try {
         model.setValue(latestDocument);
@@ -169,37 +250,58 @@ export function useCollaborativeEditor(roomCode) {
         isApplyingRemoteRef.current = false;
       }
 
-      // Reset to the authoritative version.
       versionRef.current = version;
     };
 
-    // Add a participant to the presence list when they join.
     const handleParticipantJoined = (participant) => {
       if (participant?.id || participant?._id) {
         dispatch(addParticipant(participant));
       }
     };
 
-    // Mark a participant offline when they leave.
     const handleParticipantLeft = (payload) => {
       const participantId = payload?.participantId;
       if (participantId) {
         dispatch(removeParticipant(participantId));
+        // Clean up remote cursor
+        remoteCursorsRef.current.delete(participantId);
+        updateCursorDecorations();
+        dispatch(setTypingStatus({ participantId, isTyping: false }));
       }
     };
 
-    // Show the closed-room overlay when the host ends the session.
     const handleRoomClosed = (payload) => {
       setRoomClosed(true);
       setClosedBy(payload?.hostName || "The host");
     };
 
-    // Redirect home when this participant is kicked by the host.
     const handleParticipantKicked = () => {
       router.push("/");
     };
 
-    // Fetch the initial document, then open the socket.
+    // Remote cursor moved
+    const handleRemoteCursor = ({ userId, offset, displayName }) => {
+      const color = getColorForUser(userId);
+      remoteCursorsRef.current.set(userId, { offset, color, displayName });
+      updateCursorDecorations();
+    };
+
+    // Remote cursor disconnected
+    const handleCursorDisconnect = ({ userId }) => {
+      remoteCursorsRef.current.delete(userId);
+      updateCursorDecorations();
+    };
+
+    // Remote typing started
+    const handleTypingStart = ({ participantId }) => {
+      dispatch(setTypingStatus({ participantId, isTyping: true }));
+    };
+
+    // Remote typing stopped
+    const handleTypingStop = ({ participantId }) => {
+      dispatch(setTypingStatus({ participantId, isTyping: false }));
+    };
+
     const start = async () => {
       try {
         const res = await getRoom(roomCode);
@@ -207,26 +309,18 @@ export function useCollaborativeEditor(roomCode) {
 
         const data = res.data.data;
 
-        console.log("DEBUG COLLAB: authUser =", authUserRef.current);
-        console.log("DEBUG COLLAB: participants =", data.participants);
-
-        // Resolve this client's participant by matching the authenticated user.
         let me = data.participants.find(
           (participant) => participant.userId === authUserRef.current?.id,
         );
 
         if (!me && authUserRef.current) {
           try {
-            console.log(
-              "DEBUG COLLAB: User not in participants list. Auto-joining...",
-            );
             await joinRoomApi({
               roomCode,
               displayName: authUserRef.current.username,
               userId: authUserRef.current.id,
             });
 
-            // Re-fetch the fresh participant list to obtain the guest's participant ID
             const freshRes = await getRoom(roomCode);
             const freshData = freshRes.data.data;
             data.participants = freshData.participants;
@@ -235,18 +329,13 @@ export function useCollaborativeEditor(roomCode) {
               (participant) => participant.userId === authUserRef.current?.id,
             );
           } catch (joinError) {
-            console.error("DEBUG COLLAB: Auto-join failed:", joinError);
+            console.error("Auto-join failed:", joinError);
           }
         }
 
         participantRef.current = me || null;
-
-        console.log("DEBUG COLLAB: resolved me =", me);
-
-        // Initialize the base version from the persisted room version.
         versionRef.current = data.room.version ?? 1;
 
-        // Store room state for the surrounding UI.
         dispatch(
           setRoom({
             roomDetails: data.room,
@@ -255,10 +344,8 @@ export function useCollaborativeEditor(roomCode) {
           }),
         );
 
-        // Load the initial document into local state for Monaco.
-        setDocument(data.room.document || "");
+        setEditorDocument(data.room.document || "");
       } catch (error) {
-        // A missing, closed or inaccessible room returns the user to the landing page.
         console.error("Failed to load room:", error);
         if (!cancelled) router.push("/");
         return;
@@ -266,7 +353,6 @@ export function useCollaborativeEditor(roomCode) {
 
       if (cancelled) return;
 
-      // Register connection, collaboration and presence listeners, then open the socket.
       socket.on("connect", handleConnect);
       socket.on("disconnect", handleDisconnect);
       socket.on("code-change", handleRemoteChange);
@@ -275,6 +361,10 @@ export function useCollaborativeEditor(roomCode) {
       socket.on("participant-left", handleParticipantLeft);
       socket.on("participant-kicked", handleParticipantKicked);
       socket.on("room-closed", handleRoomClosed);
+      socket.on("remote-cursor", handleRemoteCursor);
+      socket.on("cursor-disconnect", handleCursorDisconnect);
+      socket.on("typing-start", handleTypingStart);
+      socket.on("typing-stop", handleTypingStop);
 
       if (socket.connected) {
         handleConnect();
@@ -285,11 +375,9 @@ export function useCollaborativeEditor(roomCode) {
 
     start();
 
-    // Leave the room and tear down the connection on unmount.
     return () => {
       cancelled = true;
 
-      // Stop converting local edits into deltas.
       if (changeDisposableRef.current) {
         changeDisposableRef.current.dispose();
         changeDisposableRef.current = null;
@@ -303,6 +391,10 @@ export function useCollaborativeEditor(roomCode) {
       socket.off("participant-left", handleParticipantLeft);
       socket.off("participant-kicked", handleParticipantKicked);
       socket.off("room-closed", handleRoomClosed);
+      socket.off("remote-cursor", handleRemoteCursor);
+      socket.off("cursor-disconnect", handleCursorDisconnect);
+      socket.off("typing-start", handleTypingStart);
+      socket.off("typing-stop", handleTypingStop);
 
       if (participantRef.current) {
         socket.emit("leave-room", {
@@ -314,10 +406,10 @@ export function useCollaborativeEditor(roomCode) {
       socket.disconnect();
       dispatch(clearRoom());
     };
-  }, [roomCode, dispatch, router]);
+  }, [roomCode, dispatch, router, updateCursorDecorations]);
 
   return {
-    document,
+    document: editorDocument,
     status,
     roomClosed,
     closedBy,
