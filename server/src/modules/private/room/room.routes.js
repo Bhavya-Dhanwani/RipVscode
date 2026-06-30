@@ -30,7 +30,6 @@ router.post(
 
 router.post(
   "/join",
-  authMiddleware,
   joinRoomValidator,
   validateErrors,
   asyncHandler(

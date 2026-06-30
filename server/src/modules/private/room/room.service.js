@@ -78,42 +78,23 @@ class RoomService {
 
   async joinRoomService(
     roomCode,
-    userId,
-    displayName
+    displayName,
+    userId = null
   ) {
     const room =
       await this.getRoomByCode(
         roomCode
       );
 
-    // Reuse an existing participant row for this user so a re-join (refresh,
-    // reconnect) does not create duplicate entries in the room.
-    let participant =
-      await this.ParticipantDAO.findParticipantByRoomAndUser(
-        room._id,
-        userId
+    const participant =
+      await this.ParticipantDAO.createParticipant(
+        {
+          roomId: room._id,
+          userId,
+          displayName,
+          role: "GUEST",
+        }
       );
-
-    if (participant) {
-      participant =
-        await this.ParticipantDAO.updateParticipant(
-          { _id: participant._id },
-          {
-            displayName,
-            isOnline: true,
-          }
-        );
-    } else {
-      participant =
-        await this.ParticipantDAO.createParticipant(
-          {
-            roomId: room._id,
-            userId,
-            displayName,
-            role: "GUEST",
-          }
-        );
-    }
 
     return {
       room:
@@ -140,12 +121,9 @@ class RoomService {
       );
     }
 
-    // Only surface participants currently present so the list matches the live
-    // socket-driven roster (stale/offline rows are not shown on reload).
     const participants =
       await this.ParticipantDAO.findParticipants(
-        room._id,
-        true
+        room._id
       );
 
     return {

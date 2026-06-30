@@ -43,7 +43,6 @@ export const createDeltaFromChange = (change, { version, userId }) => {
     text,
   };
 };
-
 // Convert a backend delta into a single Monaco edit operation against a model.
 // The range [position, position + length] is replaced by the delta text, which
 // uniformly expresses insert (length 0), delete (empty text) and replace.
@@ -63,58 +62,5 @@ export const deltaToMonacoOperation = (delta, model) => {
     },
     text: delta.text || "",
     forceMoveMarkers: true,
-  };
-};
-
-// Deterministic total order over two deltas, used to break insert ties.
-// MUST match the server's ConflictResolver.compareSites so both peers agree.
-const compareSites = (a, b) => {
-  const ua = a.userId ?? "";
-  const ub = b.userId ?? "";
-  if (ua < ub) return -1;
-  if (ua > ub) return 1;
-
-  const ia = a.id ?? "";
-  const ib = b.id ?? "";
-  if (ia < ib) return -1;
-  if (ia > ib) return 1;
-  return 0;
-};
-
-const shiftPosition = (position, start, removed, inserted, tieAfter) => {
-  if (position < start) return position;
-  if (position > start) {
-    if (position >= start + removed) return position - removed + inserted;
-    return start;
-  }
-  // position === start
-  if (removed > 0) return start;
-  return tieAfter ? start + inserted : start;
-};
-
-// Rebase delta `a` so it applies cleanly on a document that already has `b`
-// applied. Mirror of the server's ConflictResolver.transform; used on the
-// client to reconcile incoming remote edits against un-acked local edits.
-export const transformDelta = (a, b) => {
-  const start = b.position;
-  const removed = b.length || 0;
-  const inserted = b.text ? b.text.length : 0;
-
-  const tieAfter = removed === 0 && compareSites(a, b) > 0;
-
-  const aLength = a.length || 0;
-  const position = shiftPosition(a.position, start, removed, inserted, tieAfter);
-  const end = shiftPosition(
-    a.position + aLength,
-    start,
-    removed,
-    inserted,
-    tieAfter
-  );
-
-  return {
-    ...a,
-    position,
-    length: Math.max(0, end - position),
   };
 };

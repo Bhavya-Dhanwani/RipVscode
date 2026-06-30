@@ -2,10 +2,12 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { useSelector } from "react-redux";
 import { joinRoom } from "@/features/room/api/room.api";
 
 export default function JoinPage() {
   const router = useRouter();
+  const authUser = useSelector((state) => state.auth.user);
 
   const [form, setForm] =
     useState({
@@ -25,7 +27,10 @@ export default function JoinPage() {
     try {
       setLoading(true);
 
-      await joinRoom(form);
+      await joinRoom({
+        ...form,
+        userId: authUser?.id,
+      });
 
       router.push(
         `/room/${form.roomCode}`

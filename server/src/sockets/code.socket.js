@@ -34,17 +34,6 @@ function registerCodeEvents(
                     }
                 );
 
-                // Acknowledge the sender so it can advance its revision and flush
-                // the next buffered local edit. Without this the sender never learns
-                // the authoritative server version for its own edits.
-                socket.emit(
-                    "code-ack",
-                    {
-                        id: delta.id,
-                        version: result.version,
-                    }
-                );
-
             } catch (error) {
 
                 // Resync the sender with the latest version when the delta is stale.
