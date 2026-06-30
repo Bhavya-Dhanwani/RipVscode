@@ -17,12 +17,23 @@ function registerRoomEvents(io, socket, { roomLifecycleService, roomDAO, partici
       // Track the participant inside the active room.
       await roomLifecycleService.joinRoom(roomCode, participantId);
 
+      // Record presence and the live socket so kicks can reach this client.
+      const updated = await participantDAO.updateParticipant(
+        { _id: participantId },
+        { socketId: socket.id, isOnline: true }
+      );
+
       // Remember the membership on the socket for disconnect cleanup.
       socket.data.roomCode = roomCode;
       socket.data.participantId = participantId;
 
-      // Notify the other participants in the room.
-      socket.to(roomCode).emit("participant-joined", participant);
+      // Notify the other participants in the room with an online presence flag.
+      socket.to(roomCode).emit("participant-joined", {
+        ...participant,
+        isOnline: true,
+        socketId: socket.id,
+        role: updated?.role || participant.role,
+      });
     } catch (error) {
       // Report the join failure back to the client.
       socket.emit("room-error", {
@@ -39,6 +50,12 @@ function registerRoomEvents(io, socket, { roomLifecycleService, roomDAO, partici
 
       // Remove the participant and evict the room if it becomes empty.
       await roomLifecycleService.leaveRoom(roomCode, participantId);
+
+      // Mark the participant offline so reloads no longer list them.
+      await participantDAO.updateParticipant(
+        { _id: participantId },
+        { isOnline: false, socketId: null }
+      );
 
       // Clear the stored membership for this socket.
       socket.data.roomCode = null;
@@ -67,6 +84,12 @@ function registerRoomEvents(io, socket, { roomLifecycleService, roomDAO, partici
     try {
       // Remove the participant and evict the room if it becomes empty.
       await roomLifecycleService.leaveRoom(roomCode, participantId);
+
+      // Mark the participant offline so reloads no longer list them.
+      await participantDAO.updateParticipant(
+        { _id: participantId },
+        { isOnline: false, socketId: null }
+      );
 
       // Notify the other participants in the room.
       socket.to(roomCode).emit("participant-left", { participantId });
