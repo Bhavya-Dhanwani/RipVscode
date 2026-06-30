@@ -43,7 +43,6 @@ export const createDeltaFromChange = (change, { version, userId }) => {
     text,
   };
 };
-
 // Convert a backend delta into a single Monaco edit operation against a model.
 // The range [position, position + length] is replaced by the delta text, which
 // uniformly expresses insert (length 0), delete (empty text) and replace.

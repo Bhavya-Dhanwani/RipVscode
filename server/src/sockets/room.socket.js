@@ -1,15 +1,14 @@
 function registerRoomEvents(io, socket, { roomLifecycleService, roomDAO, participantDAO }) {
   // Handle a participant joining a room.
   socket.on("join-room", async ({ roomCode, participant }) => {
-    if (!participant || (!participant._id && !participant.id)) {
+    const participantId = participant?.id || participant?._id;
+
+    if (!participantId) {
       socket.emit("room-error", {
         message: "Invalid participant data.",
       });
       return;
     }
-
-    const participantId = participant._id || participant.id;
-
     try {
       // Join the socket.io room channel.
       socket.join(roomCode);

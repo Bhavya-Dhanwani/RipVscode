@@ -78,7 +78,8 @@ class RoomService {
 
   async joinRoomService(
     roomCode,
-    displayName
+    displayName,
+    userId = null
   ) {
     const room =
       await this.getRoomByCode(
@@ -89,6 +90,7 @@ class RoomService {
       await this.ParticipantDAO.createParticipant(
         {
           roomId: room._id,
+          userId,
           displayName,
           role: "GUEST",
         }

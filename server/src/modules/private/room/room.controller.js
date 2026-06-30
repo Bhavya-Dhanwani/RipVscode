@@ -38,12 +38,14 @@ class RoomController {
     const {
       roomCode,
       displayName,
+      userId,
     } = req.body;
 
     const response =
       await this.roomService.joinRoomService(
         roomCode,
-        displayName
+        displayName,
+        userId
       );
 
     return ApiResponse(

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { useRouter } from "next/navigation";
 import { socket } from "@/lib/socket";
-import { getRoom } from "../api/room.api";
+import { getRoom, joinRoom as joinRoomApi } from "../api/room.api";
 import {
   setRoom,
   clearRoom,
@@ -17,7 +17,6 @@ import { createDeltaFromChange, deltaToMonacoOperation } from "../lib/delta";
 // loads the initial document, resolves this client's identity, manages the
 // Socket.IO connection, applies remote edits, and tracks presence and closure.
 export function useCollaborativeEditor(roomCode) {
-
   const dispatch = useDispatch();
   const router = useRouter();
   const authUser = useSelector((state) => state.auth.user);
@@ -53,34 +52,36 @@ export function useCollaborativeEditor(roomCode) {
   }, [authUser]);
 
   // Capture the Monaco instances and start converting local edits into deltas.
-  const handleEditorMount = useCallback((editor, monaco) => {
-    editorRef.current = editor;
-    monacoRef.current = monaco;
+  const handleEditorMount = useCallback(
+    (editor, monaco) => {
+      editorRef.current = editor;
+      monacoRef.current = monaco;
 
-    // Convert local Monaco edits into backend deltas and emit them.
-    changeDisposableRef.current = editor.onDidChangeModelContent((event) => {
+      // Convert local Monaco edits into backend deltas and emit them.
+      changeDisposableRef.current = editor.onDidChangeModelContent((event) => {
+        // Ignore edits produced by applying a remote delta to avoid feedback loops.
+        if (isApplyingRemoteRef.current) return;
 
-      // Ignore edits produced by applying a remote delta to avoid feedback loops.
-      if (isApplyingRemoteRef.current) return;
+        // Apply higher offsets first so earlier (lower) offsets stay valid.
+        const orderedChanges = [...event.changes].sort(
+          (a, b) => b.rangeOffset - a.rangeOffset,
+        );
 
-      // Apply higher offsets first so earlier (lower) offsets stay valid.
-      const orderedChanges = [...event.changes].sort(
-        (a, b) => b.rangeOffset - a.rangeOffset
-      );
+        // Emit one delta per change, advancing the local version each time.
+        for (const change of orderedChanges) {
+          const delta = createDeltaFromChange(change, {
+            version: versionRef.current,
+            userId: authUserRef.current?.id,
+          });
+          if (!delta) continue;
 
-      // Emit one delta per change, advancing the local version each time.
-      for (const change of orderedChanges) {
-        const delta = createDeltaFromChange(change, {
-          version: versionRef.current,
-          userId: authUserRef.current?.id,
-        });
-        if (!delta) continue;
-
-        socket.emit("code-change", { roomCode, delta });
-        versionRef.current += 1;
-      }
-    });
-  }, [roomCode]);
+          socket.emit("code-change", { roomCode, delta });
+          versionRef.current += 1;
+        }
+      });
+    },
+    [roomCode],
+  );
 
   // Leave the room; the host additionally ends the session for everyone else.
   const leaveRoom = useCallback(() => {
@@ -99,16 +100,19 @@ export function useCollaborativeEditor(roomCode) {
   }, [roomCode, router]);
 
   // Kick a participant from the room (host only).
-  const kickParticipant = useCallback((targetParticipantId) => {
-    const me = participantRef.current;
-    if (!me || me.role !== "HOST") return;
+  const kickParticipant = useCallback(
+    (targetParticipantId) => {
+      const me = participantRef.current;
+      if (!me || me.role !== "HOST") return;
 
-    socket.emit("kick-participant", {
-      roomCode,
-      hostParticipantId: me.id || me._id,
-      targetParticipantId,
-    });
-  }, [roomCode]);
+      socket.emit("kick-participant", {
+        roomCode,
+        hostParticipantId: me.id || me._id,
+        targetParticipantId,
+      });
+    },
+    [roomCode],
+  );
 
   // Load the room and open/clean up the realtime connection.
   useEffect(() => {
@@ -203,11 +207,41 @@ export function useCollaborativeEditor(roomCode) {
 
         const data = res.data.data;
 
+        console.log("DEBUG COLLAB: authUser =", authUserRef.current);
+        console.log("DEBUG COLLAB: participants =", data.participants);
+
         // Resolve this client's participant by matching the authenticated user.
-        const me = data.participants.find(
-          (participant) => participant.userId === authUserRef.current?.id
+        let me = data.participants.find(
+          (participant) => participant.userId === authUserRef.current?.id,
         );
+
+        if (!me && authUserRef.current) {
+          try {
+            console.log(
+              "DEBUG COLLAB: User not in participants list. Auto-joining...",
+            );
+            await joinRoomApi({
+              roomCode,
+              displayName: authUserRef.current.username,
+              userId: authUserRef.current.id,
+            });
+
+            // Re-fetch the fresh participant list to obtain the guest's participant ID
+            const freshRes = await getRoom(roomCode);
+            const freshData = freshRes.data.data;
+            data.participants = freshData.participants;
+
+            me = data.participants.find(
+              (participant) => participant.userId === authUserRef.current?.id,
+            );
+          } catch (joinError) {
+            console.error("DEBUG COLLAB: Auto-join failed:", joinError);
+          }
+        }
+
         participantRef.current = me || null;
+
+        console.log("DEBUG COLLAB: resolved me =", me);
 
         // Initialize the base version from the persisted room version.
         versionRef.current = data.room.version ?? 1;
@@ -218,7 +252,7 @@ export function useCollaborativeEditor(roomCode) {
             roomDetails: data.room,
             participants: data.participants,
             currentParticipant: me || null,
-          })
+          }),
         );
 
         // Load the initial document into local state for Monaco.

@@ -3,16 +3,48 @@
 class ConflictResolver {
 
     transform(incomingDelta, appliedDelta) {
+        let position = incomingDelta.position;
+        let length = incomingDelta.length;
 
-        // Shift the incoming position to account for the already-applied delta.
-        const position = this.shiftPosition(incomingDelta.position, appliedDelta);
+        const start = appliedDelta.position;
+        const removed = appliedDelta.length || 0;
+        const inserted = appliedDelta.text ? appliedDelta.text.length : 0;
 
-        // Return a new delta with the adjusted position, preserving all other fields.
+        // 1. Transform position
+        if (position >= start) {
+            if (position >= start + removed) {
+                position = position - removed + inserted;
+            } else {
+                position = start;
+            }
+        }
+
+        // 2. Transform length (for deletions and replacements)
+        if ((incomingDelta.type === "delete" || incomingDelta.type === "replace") && typeof length === "number") {
+            const incomingStart = incomingDelta.position;
+            const incomingEnd = incomingStart + length;
+
+            if (appliedDelta.type === "insert") {
+                // If insertion falls inside the deleted range, expand the delete length
+                if (incomingStart < start && incomingEnd > start) {
+                    length += inserted;
+                }
+            } else if (appliedDelta.type === "delete" || appliedDelta.type === "replace") {
+                // If overlapping deletions, reduce the length by the intersection
+                const appliedEnd = start + removed;
+                const intersectionStart = Math.max(incomingStart, start);
+                const intersectionEnd = Math.min(incomingEnd, appliedEnd);
+                const intersectionLen = Math.max(0, intersectionEnd - intersectionStart);
+
+                length -= intersectionLen;
+            }
+        }
+
         return {
             ...incomingDelta,
             position,
+            ...(length !== undefined ? { length } : {}),
         };
-
     }
 
     resolve(incomingDelta, appliedDeltas) {
@@ -30,28 +62,7 @@ class ConflictResolver {
 
     }
 
-    shiftPosition(position, appliedDelta) {
-
-        // Resolve the applied delta's footprint on the document.
-        const start = appliedDelta.position;
-        const removed = appliedDelta.length || 0;
-        const inserted = appliedDelta.text ? appliedDelta.text.length : 0;
-
-        // Positions before the change are unaffected.
-        if (position <= start) {
-            return position;
-        }
-
-        // Positions after the affected range shift by the net length change.
-        if (position >= start + removed) {
-            return position - removed + inserted;
-        }
-
-        // Positions inside a removed range collapse to the change start.
-        return start;
-
-    }
-
 }
 
 export default ConflictResolver;
+

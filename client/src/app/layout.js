@@ -21,15 +21,13 @@ export const metadata = {
   description: "Real-time collaborative code editor",
 };
 
-export default function RootLayout({
-  children,
-}) {
+export default function RootLayout({ children }) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable}`}
-    >
-      <body className="font-['Inter'] bg-[#F7F5F0] text-[#111111]">
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
+      <body
+        className="font-['Inter'] bg-[#F7F5F0] text-[#111111]"
+        suppressHydrationWarning
+      >
         <Providers>
           <PageTransition />
           {children}
