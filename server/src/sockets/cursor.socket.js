@@ -1,10 +1,16 @@
 const registerCursorEvents = (io, socket) => {
+  // Identify a cursor by the participant id so the roster and carets share a key
+  // (falling back to the socket id before the participant has joined).
+  const cursorUserId = () => socket.data.participantId || socket.id;
+
   // 1. Listen for remote cursor movements
-  socket.on("cursor-move", ({ roomCode, offset }) => {
-    // Broadcast the cursor offset to everyone else in the room
+  socket.on("cursor-move", ({ roomCode, offset, displayName, color }) => {
+    // Broadcast the cursor offset and identity to everyone else in the room
     socket.to(roomCode).emit("remote-cursor", {
-      userId: socket.id,
+      userId: cursorUserId(),
       offset,
+      displayName,
+      color,
     });
   });
 
@@ -13,7 +19,7 @@ const registerCursorEvents = (io, socket) => {
     socket.rooms.forEach((roomCode) => {
       if (roomCode !== socket.id) {
         socket.to(roomCode).emit("cursor-disconnect", {
-          userId: socket.id,
+          userId: cursorUserId(),
         });
       }
     });

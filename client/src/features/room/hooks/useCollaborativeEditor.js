@@ -11,7 +11,17 @@ import {
   addParticipant,
   removeParticipant,
 } from "../state/roomSlice";
-import { createDeltaFromChange, deltaToMonacoOperation } from "../lib/delta";
+import {
+  createDeltaFromChange,
+  deltaToMonacoOperation,
+  transformDelta,
+} from "../lib/delta";
+import {
+  cursorColorFor,
+  renderRemoteCursor,
+  clearRemoteCursor,
+  clearAllRemoteCursors,
+} from "../lib/cursors";
 
 export function useCollaborativeEditor(roomCode) {
   const dispatch = useDispatch();
@@ -27,7 +37,11 @@ export function useCollaborativeEditor(roomCode) {
   const monacoRef = useRef(null);
   const participantRef = useRef(null);
   const authUserRef = useRef(authUser);
-  const versionRef = useRef(1);
+  // OT client state: last server version we are synced to, the single delta in
+  // flight awaiting an ack, and the queue of local deltas not yet sent.
+  const revisionRef = useRef(1);
+  const outstandingRef = useRef(null);
+  const pendingRef = useRef([]);
   const isApplyingRemoteRef = useRef(false);
   const changeDisposableRef = useRef(null);
   const routerRef = useRef(router);
@@ -37,6 +51,41 @@ export function useCollaborativeEditor(roomCode) {
     authUserRef.current = authUser;
   }, [authUser]);
 
+  // Send a delta to the server, stamping it with the version it is based on.
+  // The base version is read at send time so a delta that waited in the queue
+  // is tagged with the revision that actually preceded it.
+  const sendDelta = useCallback((delta) => {
+    const toSend = { ...delta, version: revisionRef.current };
+    outstandingRef.current = toSend;
+    socket.emit("code-change", { roomCode, delta: toSend });
+  }, [roomCode]);
+
+  // Queue a local edit: send immediately when nothing is in flight, otherwise
+  // buffer it until the outstanding delta is acknowledged.
+  const queueLocalDelta = useCallback((delta) => {
+    if (outstandingRef.current === null) {
+      sendDelta(delta);
+    } else {
+      pendingRef.current.push(delta);
+    }
+  }, [sendDelta]);
+
+  // Emit this client's cursor position with identity so peers can label it.
+  const emitCursor = useCallback((editor) => {
+    const model = editor.getModel();
+    const position = editor.getPosition();
+    if (!model || !position) return;
+
+    const me = participantRef.current;
+    const offset = model.getOffsetAt(position);
+    socket.emit("cursor-move", {
+      roomCode,
+      offset,
+      displayName: me?.displayName || "Guest",
+      color: cursorColorFor(me?.id || me?._id || ""),
+    });
+  }, [roomCode]);
+
   // ── Editor mount: wire local edits → deltas → socket ──
   const handleEditorMount = useCallback((editor, monaco) => {
     editorRef.current = editor;
@@ -45,35 +94,31 @@ export function useCollaborativeEditor(roomCode) {
     changeDisposableRef.current = editor.onDidChangeModelContent((event) => {
       if (isApplyingRemoteRef.current) return;
 
+      // Apply highest-offset changes first so lower-offset positions in the same
+      // event stay valid; queue each as an independent local delta.
       const orderedChanges = [...event.changes].sort(
         (a, b) => b.rangeOffset - a.rangeOffset
       );
 
       for (const change of orderedChanges) {
         const delta = createDeltaFromChange(change, {
-          version: versionRef.current,
+          version: 0,
           userId: authUserRef.current?.id,
         });
         if (!delta) continue;
 
-        socket.emit("code-change", { roomCode, delta });
-        versionRef.current += 1;
+        queueLocalDelta(delta);
       }
 
       // Emit cursor position after edits so others see updated position.
-      const position = editor.getPosition();
-      if (position) {
-        const offset = editor.getModel().getOffsetAt(position);
-        socket.emit("cursor-move", { roomCode, offset });
-      }
+      emitCursor(editor);
     });
 
     // Track cursor movement (not just text changes).
-    editor.onDidChangeCursorPosition((e) => {
-      const offset = editor.getModel().getOffsetAt(e.position);
-      socket.emit("cursor-move", { roomCode, offset });
+    editor.onDidChangeCursorPosition(() => {
+      emitCursor(editor);
     });
-  }, [roomCode]);
+  }, [queueLocalDelta, emitCursor]);
 
   // ── Leave / End Session ──
   const leaveRoom = useCallback(() => {
@@ -98,6 +143,9 @@ export function useCollaborativeEditor(roomCode) {
 
     let cancelled = false;
 
+    // Per-user remote cursor widgets for this editor, keyed by participant id.
+    const cursorState = {};
+
     const handleConnect = () => {
       setStatus("connected");
       if (participantRef.current) {
@@ -110,19 +158,55 @@ export function useCollaborativeEditor(roomCode) {
 
     const handleDisconnect = () => setStatus("disconnected");
 
+    // The server acknowledges our own edits so we can advance our revision and
+    // release the next buffered local delta.
+    const handleAck = ({ version }) => {
+      revisionRef.current = version;
+      const next = pendingRef.current.shift();
+      if (next) {
+        sendDelta(next);
+      } else {
+        outstandingRef.current = null;
+      }
+    };
+
     const handleRemoteChange = ({ delta, version }) => {
       const editor = editorRef.current;
       const model = editor?.getModel();
       if (!model) return;
 
+      // Collect our un-acked local edits in sequence (outstanding first).
+      const local = [];
+      if (outstandingRef.current) local.push(outstandingRef.current);
+      for (const op of pendingRef.current) local.push(op);
+
+      // Rebase the incoming op past each local op, and each local op past the
+      // incoming op, so both sides converge on the same document (TP1).
+      let incoming = delta;
+      const rebasedLocal = [];
+      for (const localOp of local) {
+        rebasedLocal.push(transformDelta(localOp, incoming));
+        incoming = transformDelta(incoming, localOp);
+      }
+
+      // Apply the fully-transformed incoming op to our document.
       isApplyingRemoteRef.current = true;
       try {
-        const operation = deltaToMonacoOperation(delta, model);
+        const operation = deltaToMonacoOperation(incoming, model);
         editor.executeEdits("remote", [operation]);
       } finally {
         isApplyingRemoteRef.current = false;
       }
-      versionRef.current = version;
+
+      // Store the rebased local ops back into outstanding/pending.
+      if (outstandingRef.current) {
+        outstandingRef.current = rebasedLocal[0] ?? null;
+        pendingRef.current = rebasedLocal.slice(1);
+      } else {
+        pendingRef.current = rebasedLocal;
+      }
+
+      revisionRef.current = version;
     };
 
     const handleSyncRequired = ({ version, document: latestDocument }) => {
@@ -136,7 +220,11 @@ export function useCollaborativeEditor(roomCode) {
       } finally {
         isApplyingRemoteRef.current = false;
       }
-      versionRef.current = version;
+
+      // Drop any in-flight/buffered local edits; the document was fully reset.
+      revisionRef.current = version;
+      outstandingRef.current = null;
+      pendingRef.current = [];
     };
 
     const handleParticipantJoined = (participant) => {
@@ -149,6 +237,8 @@ export function useCollaborativeEditor(roomCode) {
       const participantId = payload?.participantId;
       if (participantId) {
         dispatch(removeParticipant(participantId));
+        // Clear their caret too (covers explicit leave, not just disconnect).
+        clearRemoteCursor(editorRef.current, cursorState, participantId);
       }
     };
 
@@ -161,47 +251,21 @@ export function useCollaborativeEditor(roomCode) {
       routerRef.current.push("/");
     };
 
-    // ── Remote cursors ──
-    const decorationsRef = {};
-
-    const handleRemoteCursor = ({ userId, offset }) => {
+    // ── Remote cursors ── (per-user content widgets keyed by participant id)
+    const handleRemoteCursor = ({ userId, offset, displayName, color }) => {
       const editor = editorRef.current;
-      const model = editor?.getModel();
-      if (!model || !monacoRef.current) return;
+      if (!editor || !monacoRef.current) return;
 
-      const position = model.getPositionAt(offset);
-
-      // Remove old decoration for this user.
-      if (decorationsRef[userId]) {
-        editor.deltaDecorations(decorationsRef[userId], []);
-      }
-
-      // Add a cursor line decoration.
-      const newDecorations = editor.deltaDecorations([], [
-        {
-          range: {
-            startLineNumber: position.lineNumber,
-            startColumn: position.column,
-            endLineNumber: position.lineNumber,
-            endColumn: position.column + 1,
-          },
-          options: {
-            className: `remote-cursor-${userId.slice(0, 6)}`,
-            stickiness: 1,
-            hoverMessage: { value: `**User ${userId.slice(0, 6)}**` },
-          },
-        },
-      ]);
-
-      decorationsRef[userId] = newDecorations;
+      renderRemoteCursor(editor, monacoRef.current, cursorState, {
+        userId,
+        offset,
+        displayName,
+        color,
+      });
     };
 
     const handleCursorDisconnect = ({ userId }) => {
-      const editor = editorRef.current;
-      if (!editor || !decorationsRef[userId]) return;
-
-      editor.deltaDecorations(decorationsRef[userId], []);
-      delete decorationsRef[userId];
+      clearRemoteCursor(editorRef.current, cursorState, userId);
     };
 
     // ── Fetch room data, then connect ──
@@ -217,7 +281,9 @@ export function useCollaborativeEditor(roomCode) {
         );
         participantRef.current = me || null;
 
-        versionRef.current = data.room.version ?? 1;
+        revisionRef.current = data.room.version ?? 1;
+        outstandingRef.current = null;
+        pendingRef.current = [];
 
         dispatch(
           setRoom({
@@ -240,6 +306,7 @@ export function useCollaborativeEditor(roomCode) {
       socket.on("connect", handleConnect);
       socket.on("disconnect", handleDisconnect);
       socket.on("code-change", handleRemoteChange);
+      socket.on("code-ack", handleAck);
       socket.on("sync-required", handleSyncRequired);
       socket.on("participant-joined", handleParticipantJoined);
       socket.on("participant-left", handleParticipantLeft);
@@ -268,6 +335,7 @@ export function useCollaborativeEditor(roomCode) {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.off("code-change", handleRemoteChange);
+      socket.off("code-ack", handleAck);
       socket.off("sync-required", handleSyncRequired);
       socket.off("participant-joined", handleParticipantJoined);
       socket.off("participant-left", handleParticipantLeft);
@@ -275,6 +343,9 @@ export function useCollaborativeEditor(roomCode) {
       socket.off("room-closed", handleRoomClosed);
       socket.off("remote-cursor", handleRemoteCursor);
       socket.off("cursor-disconnect", handleCursorDisconnect);
+
+      // Tear down any remaining remote cursor widgets.
+      clearAllRemoteCursors(editorRef.current, cursorState);
 
       if (participantRef.current) {
         socket.emit("leave-room", {

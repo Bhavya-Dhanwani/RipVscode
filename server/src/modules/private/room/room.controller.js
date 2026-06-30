@@ -40,9 +40,12 @@ class RoomController {
       displayName,
     } = req.body;
 
+    const userId = req.user.id;
+
     const response =
       await this.roomService.joinRoomService(
         roomCode,
+        userId,
         displayName
       );
 
